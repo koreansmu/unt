@@ -1,23 +1,27 @@
-import youtubedl from "youtube-dl-exec"; // or switch to 'yt-dlp-exec' for better reliability
+import youtubedl from "yt-dlp-exec";
 import { createReadStream } from "fs";
 import { unlink } from "fs/promises";
-import fs, { existsSync, readdirSync } from "fs";
+import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import dotenv from "dotenv";  // NEW
+
+dotenv.config(); // NEW
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// Helper to clean up the filename
 const sanitizeFilename = (filename) => {
-  return filename.replace(/[^a-z0-9]/gi, "_").substring(0, 100); // Truncate long titles
+  return filename.replace(/[^a-z0-9]/gi, "_");
 };
 
 const isValidYoutubeUrl = (url) => {
   try {
     const urlObj = new URL(url);
     return (
-      ["youtube.com", "www.youtube.com", "youtu.be"].includes(urlObj.hostname) &&
+      (urlObj.hostname === "www.youtube.com" ||
+        urlObj.hostname === "youtube.com" ||
+        urlObj.hostname === "youtu.be") &&
       (urlObj.pathname.includes("/watch") || urlObj.hostname === "youtu.be")
     );
   } catch {
@@ -30,6 +34,8 @@ const audio = async (req, res) => {
 
   try {
     const { videoUrl, getInfo } = req.body;
+    const proxy =
+      req.headers["x-proxy"] || process.env.YT_DLP_PROXY || null; // NEW
 
     if (!videoUrl || !isValidYoutubeUrl(videoUrl)) {
       return res.status(400).json({
@@ -37,24 +43,20 @@ const audio = async (req, res) => {
       });
     }
 
-    let info;
-    try {
-      info = await youtubedl(videoUrl, {
-        dumpSingleJson: true,
-        noWarnings: true,
-        noCallHome: true,
-        preferFreeFormats: true,
-        youtubeSkipDashManifest: true,
-      });
-    } catch (err) {
-      console.error("youtube-dl info error:", err.stderr || err.message || err);
-      return res.status(500).json({
-        error: "youtube-dl failed to fetch video info",
-        details: err.stderr || err.message || "unknown error",
-      });
-    }
+    const commonOptions = {
+      noWarnings: true,
+      noCallHome: true,
+      preferFreeFormats: true,
+      youtubeSkipDashManifest: true,
+      ...(proxy && { proxy }), // NEW: Add proxy if set
+    };
 
-    // If only info is requested
+    // Get video info
+    const info = await youtubedl(videoUrl, {
+      dumpSingleJson: true,
+      ...commonOptions,
+    });
+
     if (getInfo) {
       const formats = info.formats
         .filter((f) => f.acodec !== "none" && f.vcodec === "none")
@@ -75,44 +77,31 @@ const audio = async (req, res) => {
       });
     }
 
-    // Ensure downloads folder exists
-    const downloadsDir = path.join(__dirname, "..", "..", "downloads");
-    if (!existsSync(downloadsDir)) fs.mkdirSync(downloadsDir, { recursive: true });
-
     const filename = sanitizeFilename(info.title) + ".mp3";
-    tempFilePath = path.join(downloadsDir, filename);
+    tempFilePath = path.join(__dirname, "..", "..", "downloads", filename);
 
-    const options = {
+    const downloadOptions = {
       extractAudio: true,
       audioFormat: "mp3",
       audioQuality: 0,
       output: tempFilePath,
-      noWarnings: true,
-      noCallHome: true,
-      preferFreeFormats: true,
-      youtubeSkipDashManifest: true,
+      ...commonOptions,
     };
 
-    // Perform the download
-    console.log("Downloading to:", tempFilePath);
-    await youtubedl(videoUrl, options);
-
-    if (!existsSync(tempFilePath)) {
-      throw new Error(`File not found after download: ${tempFilePath}`);
-    }
-
-    const stat = await fs.promises.stat(tempFilePath);
-    const fileSize = stat.size;
-    const range = req.headers.range;
+    await youtubedl(videoUrl, downloadOptions);
 
     res.header("Content-Type", "audio/mp3");
     res.header("Accept-Ranges", "bytes");
     res.header("Cache-Control", "no-cache");
 
+    const stat = await fs.promises.stat(tempFilePath);
+    const fileSize = stat.size;
+    const range = req.headers.range;
+
     if (range) {
-      const parts = range.replace(/bytes=/, "").split("-");
-      const start = parseInt(parts[0], 10);
-      const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+      const [startStr, endStr] = range.replace(/bytes=/, "").split("-");
+      const start = parseInt(startStr, 10);
+      const end = endStr ? parseInt(endStr, 10) : fileSize - 1;
       const chunksize = end - start + 1;
 
       res.status(206);
@@ -120,42 +109,39 @@ const audio = async (req, res) => {
       res.header("Content-Length", chunksize);
 
       const stream = createReadStream(tempFilePath, { start, end });
-      stream.pipe(res);
-
-      stream.on("end", async () => {
+      stream.pipe(res).on("end", async () => {
         try {
           await unlink(tempFilePath);
         } catch (err) {
-          console.error("Cleanup error:", err.message);
+          console.error("Error deleting temp file:", err);
         }
       });
     } else {
       res.header("Content-Length", fileSize);
-      const stream = createReadStream(tempFilePath);
-      stream.pipe(res);
 
-      stream.on("end", async () => {
+      const stream = createReadStream(tempFilePath);
+      stream.pipe(res).on("end", async () => {
         try {
           await unlink(tempFilePath);
         } catch (err) {
-          console.error("Cleanup error:", err.message);
+          console.error("Error deleting temp file:", err);
         }
       });
     }
   } catch (error) {
-    if (tempFilePath && existsSync(tempFilePath)) {
+    if (tempFilePath) {
       try {
         await unlink(tempFilePath);
       } catch (err) {
-        console.error("Failed to delete temp file:", err.message);
+        console.error("Error deleting temp file:", err);
       }
     }
 
-    console.error("Main error:", error.message || error);
+    console.error("Download error:", error);
     if (!res.headersSent) {
       res.status(500).json({
         error: "Failed to process YouTube audio",
-        details: error.message || error,
+        details: error.message,
       });
     }
   }
