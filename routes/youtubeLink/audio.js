@@ -1,7 +1,6 @@
 import youtubedl from "youtube-dl-exec";
-import { createReadStream } from "fs";
-import { unlink } from "fs/promises";
-import fs from "fs";
+import { createReadStream, existsSync, mkdirSync, readdirSync } from "fs";
+import { unlink, stat } from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
 
@@ -28,17 +27,15 @@ const isValidYoutubeUrl = (url) => {
 
 const audio = async (req, res) => {
   let tempFilePath = null;
+  const downloadsDir = path.join(__dirname, "..", "..", "downloads");
 
   try {
     const { videoUrl, getInfo } = req.body;
 
     if (!videoUrl || !isValidYoutubeUrl(videoUrl)) {
-      return res
-        .status(400)
-        .json({
-          error:
-            "Invalid YouTube URL. Please provide a valid youtube.com or youtu.be URL",
-        });
+      return res.status(400).json({
+        error: "Invalid YouTube URL. Please provide a valid youtube.com or youtu.be URL",
+      });
     }
 
     // Get video info
@@ -50,7 +47,7 @@ const audio = async (req, res) => {
       youtubeSkipDashManifest: true,
     });
 
-    // If only info is requested, return audio formats
+    // If only info is requested
     if (getInfo) {
       const formats = info.formats
         .filter((f) => f.acodec !== "none" && f.vcodec === "none")
@@ -71,15 +68,19 @@ const audio = async (req, res) => {
       });
     }
 
-    // Create unique filename
-    const filename = sanitizeFilename(info.title) + ".mp3";
-    tempFilePath = path.join(__dirname, "..", "..", "downloads", filename);
+    // Ensure download folder exists
+    if (!existsSync(downloadsDir)) {
+      mkdirSync(downloadsDir, { recursive: true });
+    }
 
-    // Set up download options for best audio quality
+    // Set up output path
+    const filename = sanitizeFilename(info.title) + ".mp3";
+    tempFilePath = path.join(downloadsDir, filename);
+
     const options = {
       extractAudio: true,
       audioFormat: "mp3",
-      audioQuality: 0, // Best quality
+      audioQuality: 0,
       output: tempFilePath,
       noWarnings: true,
       noCallHome: true,
@@ -87,23 +88,26 @@ const audio = async (req, res) => {
       youtubeSkipDashManifest: true,
     };
 
-    // Download the audio
+    console.log("Downloading to:", tempFilePath);
     await youtubedl(videoUrl, options);
 
-    // Set headers for preview
+    if (!existsSync(tempFilePath)) {
+      console.error("File not found after download:", tempFilePath);
+      return res.status(500).json({ error: "Audio file not created." });
+    }
+
+    const fileStat = await stat(tempFilePath);
+    const fileSize = fileStat.size;
+    const range = req.headers.range;
+
     res.header("Content-Type", "audio/mp3");
     res.header("Accept-Ranges", "bytes");
     res.header("Cache-Control", "no-cache");
 
-    // Handle range requests for better streaming
-    const stat = await fs.promises.stat(tempFilePath);
-    const fileSize = stat.size;
-    const range = req.headers.range;
-
     if (range) {
-      const parts = range.replace(/bytes=/, "").split("-");
-      const start = parseInt(parts[0], 10);
-      const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+      const [startStr, endStr] = range.replace(/bytes=/, "").split("-");
+      const start = parseInt(startStr, 10);
+      const end = endStr ? parseInt(endStr, 10) : fileSize - 1;
       const chunksize = end - start + 1;
 
       res.status(206);
@@ -114,36 +118,31 @@ const audio = async (req, res) => {
       stream.pipe(res);
 
       stream.on("end", async () => {
-        // Clean up temp file after streaming
         try {
           await unlink(tempFilePath);
         } catch (err) {
-          console.error("Error deleting temp file:", err);
+          console.error("Error deleting file:", err);
         }
       });
     } else {
-      // No range header - send entire file
       res.header("Content-Length", fileSize);
-
       const stream = createReadStream(tempFilePath);
       stream.pipe(res);
 
       stream.on("end", async () => {
-        // Clean up temp file after streaming
         try {
           await unlink(tempFilePath);
         } catch (err) {
-          console.error("Error deleting temp file:", err);
+          console.error("Error deleting file:", err);
         }
       });
     }
   } catch (error) {
-    // Clean up temp file if it exists
-    if (tempFilePath) {
+    if (tempFilePath && existsSync(tempFilePath)) {
       try {
         await unlink(tempFilePath);
       } catch (err) {
-        console.error("Error deleting temp file:", err);
+        console.error("Cleanup error:", err);
       }
     }
 
