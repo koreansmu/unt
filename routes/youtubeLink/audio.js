@@ -1,12 +1,12 @@
-import youtubedl from "yt-dlp-exec";
+import youtubedl from "youtube-dl-exec";
 import { createReadStream } from "fs";
 import { unlink } from "fs/promises";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import dotenv from "dotenv";  // NEW
+import dotenv from "dotenv";
 
-dotenv.config(); // NEW
+dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -34,28 +34,25 @@ const audio = async (req, res) => {
 
   try {
     const { videoUrl, getInfo } = req.body;
-    const proxy =
-      req.headers["x-proxy"] || process.env.YT_DLP_PROXY || null; // NEW
+    const proxy = req.headers["x-proxy"] || process.env.YTDL_PROXY || null;
 
     if (!videoUrl || !isValidYoutubeUrl(videoUrl)) {
       return res.status(400).json({
-        error: "Invalid YouTube URL. Please provide a valid youtube.com or youtu.be URL",
+        error:
+          "Invalid YouTube URL. Please provide a valid youtube.com or youtu.be URL",
       });
     }
 
     const commonOptions = {
+      dumpSingleJson: true,
       noWarnings: true,
       noCallHome: true,
       preferFreeFormats: true,
       youtubeSkipDashManifest: true,
-      ...(proxy && { proxy }), // NEW: Add proxy if set
+      ...(proxy && { proxy }), // apply proxy if provided
     };
 
-    // Get video info
-    const info = await youtubedl(videoUrl, {
-      dumpSingleJson: true,
-      ...commonOptions,
-    });
+    const info = await youtubedl(videoUrl, commonOptions);
 
     if (getInfo) {
       const formats = info.formats
@@ -85,7 +82,11 @@ const audio = async (req, res) => {
       audioFormat: "mp3",
       audioQuality: 0,
       output: tempFilePath,
-      ...commonOptions,
+      noWarnings: true,
+      noCallHome: true,
+      preferFreeFormats: true,
+      youtubeSkipDashManifest: true,
+      ...(proxy && { proxy }), // apply proxy if provided
     };
 
     await youtubedl(videoUrl, downloadOptions);
