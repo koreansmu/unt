@@ -4,6 +4,9 @@ import { unlink } from "fs/promises";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import dotenv from "dotenv";
+
+dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -31,26 +34,26 @@ const youtubeLink = async (req, res) => {
 
   try {
     const { videoUrl, quality, getInfo } = req.body;
+    const proxy = req.headers["x-proxy"] || process.env.YTDL_PROXY || null;
 
     if (!videoUrl || !isValidYoutubeUrl(videoUrl)) {
-      return res
-        .status(400)
-        .json({
-          error:
-            "Invalid YouTube URL. Please provide a valid youtube.com or youtu.be URL",
-        });
+      return res.status(400).json({
+        error:
+          "Invalid YouTube URL. Please provide a valid youtube.com or youtu.be URL",
+      });
     }
 
-    // Get video info
-    const info = await youtubedl(videoUrl, {
+    const commonOptions = {
       dumpSingleJson: true,
       noWarnings: true,
       noCallHome: true,
       preferFreeFormats: true,
       youtubeSkipDashManifest: true,
-    });
+      ...(proxy && { proxy }),
+    };
 
-    // If only info is requested, return video details
+    const info = await youtubedl(videoUrl, commonOptions);
+
     if (getInfo) {
       const formats = info.formats
         .filter(
@@ -73,40 +76,34 @@ const youtubeLink = async (req, res) => {
       });
     }
 
-    // Determine quality format
     const format = quality || "best[ext=mp4]";
-
-    // Create unique filename
     const filename = sanitizeFilename(info.title) + ".mp4";
     tempFilePath = path.join(__dirname, "..", "..", "downloads", filename);
 
-    // Download options
-    const options = {
+    const downloadOptions = {
       format,
       output: tempFilePath,
       noWarnings: true,
       noCallHome: true,
       preferFreeFormats: true,
       youtubeSkipDashManifest: true,
+      ...(proxy && { proxy }),
     };
 
-    // Download the video
-    await youtubedl(videoUrl, options);
+    await youtubedl(videoUrl, downloadOptions);
 
-    // Set headers for preview
     res.header("Content-Type", "video/mp4");
     res.header("Accept-Ranges", "bytes");
     res.header("Cache-Control", "no-cache");
 
-    // Handle range requests for better streaming
     const stat = await fs.promises.stat(tempFilePath);
     const fileSize = stat.size;
     const range = req.headers.range;
 
     if (range) {
-      const parts = range.replace(/bytes=/, "").split("-");
-      const start = parseInt(parts[0], 10);
-      const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+      const [startStr, endStr] = range.replace(/bytes=/, "").split("-");
+      const start = parseInt(startStr, 10);
+      const end = endStr ? parseInt(endStr, 10) : fileSize - 1;
       const chunksize = end - start + 1;
 
       res.status(206);
@@ -114,10 +111,7 @@ const youtubeLink = async (req, res) => {
       res.header("Content-Length", chunksize);
 
       const stream = createReadStream(tempFilePath, { start, end });
-      stream.pipe(res);
-
-      stream.on("end", async () => {
-        // Clean up temp file after streaming
+      stream.pipe(res).on("end", async () => {
         try {
           await unlink(tempFilePath);
         } catch (err) {
@@ -125,14 +119,10 @@ const youtubeLink = async (req, res) => {
         }
       });
     } else {
-      // No range header - send entire file
       res.header("Content-Length", fileSize);
 
       const stream = createReadStream(tempFilePath);
-      stream.pipe(res);
-
-      stream.on("end", async () => {
-        // Clean up temp file after streaming
+      stream.pipe(res).on("end", async () => {
         try {
           await unlink(tempFilePath);
         } catch (err) {
@@ -141,7 +131,6 @@ const youtubeLink = async (req, res) => {
       });
     }
   } catch (error) {
-    // Clean up temp file if it exists
     if (tempFilePath) {
       try {
         await unlink(tempFilePath);
